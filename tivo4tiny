@@ -1,0 +1,929 @@
+#!/usr/bin/python
+
+# ---------------------
+# Tivo 4 Tiny
+# (c) 2009 Billy Charlton, San Francisco CA, USA
+# Licensed under the GNU GPL Version 3.0  http://www.gnu.org
+
+# Code forked from https://sourceforge.net/projects/tivo4tiny/
+# Needs to be updated for Python3 yet, but I needed this project for myself.
+
+# Dependencies:
+# tivodecode, ffmpeg, python-gtk2, python-glade2, python-gconf, avahi-utils
+
+# SAMPLE CMDs
+# curl -k -c /tmp/curl-cookies.txt --digest -u tivo:6060730506 https://192.168.0.201/TiVoConnect?Command=QueryContainer\&Container=\%2FNowPlaying > x
+# mencoder -vf scale=-10:240 <infile> -o <of> -of avi -ofps 15 -ovc lavc -oac lavc -lavcopts vcodec=mpeg4:vbitrate=230:acodec=mp3:abitrate=64
+# avahi-browse -l -r -t _tivo-videos._tcp
+
+# SAMPLE AVAHI OUTPUT:
+"""
++ ath0 IPv4 Pocky3DVD                                     _tivo-videos._tcp    local
+= ath0 IPv4 Pocky3DVD                                     _tivo-videos._tcp    local
+   hostname = [DVR-2DDC.local]
+   address = [192.168.0.201]
+   port = [443]
+   txt = ["TSN=5950001C0202DDC" "platform=tcd/Series2" "swversion=9.1-01-2-595" "path=/TiVoConnect?Command=QueryContainer&Container=%2FNowPlaying" "protocol=https"]
+"""
+
+import pygtk
+pygtk.require('2.0')
+import gtk, gtk.glade, pango
+import gconf
+import xml.dom.minidom
+import os, subprocess, threading, re
+import datetime, time
+import tempfile
+import urllib2, cookielib, socket
+import logging
+import ssl
+
+from xml.dom import DOMException
+from xml.parsers.expat import ExpatError
+
+# setup logging
+logging.basicConfig(format='%(levelname)s:%(message)s', level=logging.DEBUG)
+
+# Disable SSL check
+# TODO: add SSL options and validation
+try:
+    _create_unverified_https_context = ssl._create_unverified_context
+except AttributeError:
+    # Legacy Python that doesn't verify HTTPS certificates by default
+    pass
+else:
+    # Handle target environment that doesn't support HTTPS verification
+    ssl._create_default_https_context = _create_unverified_https_context
+
+
+# popen replacements from subprocess
+PIPE = subprocess.PIPE
+STDOUT = subprocess.STDOUT
+
+# These tags are supposed to make iTunes happy, but so far we get mixed luck...
+VIDEOTAGS = '-metadata artist="%(showname)s" -metadata title="%(title)s" -metadata author="%(showname)s"'
+
+# FFMPEG conversion options. See FFmpegman page for explanation of these arcane codes.
+# Add new conversions and send them to me!
+CONVERSIONS = [
+    ["Raw Copy (MPEG-2)" , "mpg",
+        'skip'],
+
+    ["iPod/BlackBerry Curve (320x240)" , "mp4",
+        'ffmpeg -i %(infile)s -f mp4 -vcodec mpeg4 -maxrate  768 -b 512 -qmin 3 -qmax 5 -bufsize 4096 -g 300 %(tags)s -acodec libfaac -ab 128k       -s 320x240 -y "%(outfile)s.%(format)s"'],
+
+    ["iPhone/iPod Touch (480x320)" , "mp4",
+        'ffmpeg -i %(infile)s -f mp4 -vcodec mpeg4 -maxrate 1024 -b 768 -qmin 3 -qmax 5 -bufsize 4096 -g 300 %(tags)s -acodec libfaac -ab 128k       -s 480x320 -y "%(outfile)s.%(format)s"'],
+
+    ["BlackBerry Storm, Tour (480x360)" , "mp4",
+        'ffmpeg -i %(infile)s -f mp4 -vcodec mpeg4 -maxrate 2048 -b 768 -qmin 3 -qmax 5 -bufsize 4096 -g 300 %(tags)s -acodec libfaac -ab 128k       -s 480x360 -y "%(outfile)s.%(format)s"'],
+
+    ["BlackBerry Pearl (240x180)" , "mp4",
+        'ffmpeg -i %(infile)s -f mp4 -vcodec mpeg4 -maxrate  768 -b 512 -qmin 3 -qmax 5 -bufsize 4096 -g 300 %(tags)s -acodec libfaac -ab 128k -r 24 -s 240x176 -y "%(outfile)s.%(format)s"'],
+
+    ["Full-size MPEG-4" , "avi",
+        'ffmpeg -i %(infile)s -f avi -vcodec libx264 -qscale 5 -g 300 %(tags)s -acodec copy -y "%(outfile)s.%(format)s"'],
+
+    ['Audio Only (MP3)', "mp3",
+        'ffmpeg -i %(infile)s -f mp3 -ab 192k %(tags)s "%(outfile)s.%(format)s"']
+]
+
+RAWITEM = 0  # Need to know where in the CONVERSIONS list Raw copy is.
+
+# Tree model columns
+S_CHANNEL = 0
+S_TITLE = 1
+S_DATE = 2
+S_LENGTH = 3
+S_ACTION = 4
+S_URL = 5
+S_SIZE = 6
+S_SIMPLETITLE=7
+S_EPISODE=8
+
+
+# threaded function support. This is a function "decorator" that makes any function
+# defined with the @threaded prefix become its own thread instead of a function in main.
+# We'll use this to do off-main processing such as copying & transcoding.
+
+def threaded(f):
+    def wrapper(*args):
+        t = threading.Thread(target=f, args=args)
+        t.start()
+    return wrapper
+
+# This helper class keeps track of file transfer progress, one for each transfer thread.
+class ProgressKeeper:
+    def __init__(self):
+        self.progress = 0
+
+class TivoSucker:
+    # Fetch the shows from the selected Tivo.
+    @threaded
+    def populateShows(self):
+        def getText(nodelist):
+            rc = ""
+            for node in nodelist:
+                if node.nodeType == node.TEXT_NODE:
+                    rc = rc + node.data
+            return rc
+
+        gtk.gdk.threads_enter()
+        self.ListView.set_model(None)
+        self.ListStore.clear()
+        self.progressBarAll.set_fraction(0)
+        self.progressBarAll.set_sensitive(False)
+        self.labelStatus.set_markup("<i>Connecting to " + self.tivo + "...</i>")
+        self.buttonUpdate.set_sensitive(False)
+        self.ComboWhichTivo.set_sensitive(False)
+        gtk.gdk.threads_leave()
+
+        # Use urllib2 to fetch the XML directory from the Tivo.
+        fetchurl = 'https://' + self.ipaddr + '/TiVoConnect?Command=QueryContainer&Container=%2FNowPlaying&Recurse=Yes'
+        # fetchurl = 'https://' + self.ipaddr + '/TiVoConnect?Command=QueryContainer&Container=%2FNowPlaying%2F17%2F17787'
+        
+        socket.setdefaulttimeout(35) # Just in case!
+        authhandler = urllib2.HTTPDigestAuthHandler(urllib2.HTTPPasswordMgrWithDefaultRealm())
+        authhandler.add_password(
+            realm=None, 
+            uri='https://' + self.ipaddr, 
+            user='tivo', 
+            passwd=self.mak)
+        opener = urllib2.build_opener(authhandler)
+        urllib2.install_opener(opener)
+        # req = urllib2.Request(self.ipaddr, data, self._headers)
+        
+        
+
+        if self.globalhalt: return
+
+        fail_msg = ''
+        try:
+            pagehandle = urllib2.urlopen(fetchurl)
+            
+            if self.globalhalt: return
+
+            gtk.gdk.threads_enter()
+            self.labelStatus.set_markup("<i>Retrieving show listings from " + self.tivo + "...</i>")
+            gtk.gdk.threads_leave()
+            xmldatafile =  pagehandle.read()
+            if self.globalhalt: return
+
+            dom = xml.dom.minidom.parseString(xmldatafile)
+
+        except Exception as e:
+            print("Can't connect to agent: {}".format(e))
+            return False
+
+        except urllib2.URLError:
+            fail_msg = '<i>***test*** Could not connect to %s.</i>' % self.tivo
+            print(urllib2.URLError)
+
+        except (IOError, ExpatError):
+            fail_msg = '<i>Download of show list from %s failed.</i>' % self.tivo
+
+        except DOMException:
+            fail_msg = '<i>Received unparseable show list' % self.tivo
+
+        if fail_msg:
+            gtk.gdk.threads_enter()
+            self.buttonUpdate.set_sensitive(True)
+            self.ComboWhichTivo.set_sensitive(True)
+            self.labelStatus.set_markup(fail_msg)
+            gtk.gdk.threads_leave()
+
+            self.shows_are_updating = False
+            return
+
+        # Now let's walk through the file.
+        shows = dom.getElementsByTagName("Item")
+
+        for show in shows:
+            content = show.getElementsByTagName("Content")[0]
+            url = content.getElementsByTagName("Url")[0]
+            urltext = getText(url.childNodes)
+
+            details = show.getElementsByTagName("Details")[0]
+
+            t = details.getElementsByTagName("Title")[0]
+            simpletitle = getText(t.childNodes)
+            title = '<b>' + simpletitle + '</b>\n'
+
+            # Append either the episode or the long description to the title,
+            # (but not both):
+            episode = details.getElementsByTagName("EpisodeTitle")
+            if (episode.length > 0):
+                episode = getText(episode[0].childNodes)
+                title += "<small><span foreground=\"#007000\">"+episode+"</span></small>"
+            else:
+                episode = None
+                description = ""
+                desc = details.getElementsByTagName("Description")
+                if (desc.length > 0):
+                    description = getText(desc[0].childNodes)
+                    description = description[:description.find("Copyright Tribune Media")]
+                    title+= "<small><span foreground=\"#007000\">"+description+"</span></small>"
+
+            station = ""
+            ss = details.getElementsByTagName("SourceStation")
+            if (ss.length > 0): station = getText(ss[0].childNodes) + "\n"
+
+            showsize = ""
+            ss = details.getElementsByTagName("SourceSize")
+            if (ss.length > 0): showsize = getText(ss[0].childNodes)
+
+            duration = hours = minutes = ""
+            d = details.getElementsByTagName("Duration")
+            if (d.length > 0):
+                duration = float(getText(d[0].childNodes))/60000 + 0.5
+                hours = int(duration/60)
+                minutes = int (duration - hours*60)
+                duration = '%s:%02d' % (hours,minutes)
+
+            cdate = ""
+            desc = details.getElementsByTagName("CaptureDate")
+            if (desc.length > 0):
+                hextime = getText(desc[0].childNodes)[2:]
+                unixtime = str2int(hextime,16) + 30
+                dd = datetime.datetime.fromtimestamp(unixtime)
+                cdate = dd.strftime("%Y-%m-%d\n<small>%I:%M %p %A</small>")
+
+            # Add to the liststore!  Woot!!
+            self.ListStore.append([station, title, cdate, duration, None, urltext, showsize, simpletitle, episode])
+
+        # All done adding shows, now display the tree.
+        gtk.gdk.threads_enter()
+
+        self.ListView.set_model(self.ListStore)
+        self.buttonUpdate.set_sensitive(True)
+        self.ComboWhichTivo.set_sensitive(True)
+
+        # Give a hint of what to do next if the queue is empty
+        if self.Transfers:
+            self.labelStatus.set_markup('')
+        else:
+            self.labelStatus.set_markup('<i>Idle. Double-click a show to begin transfer.</i>')
+
+        # We're big hacks!  We sort twice so the Length column doesn't force a scrollbar.
+        self.ListStore.set_sort_column_id(3,gtk.SORT_ASCENDING)
+        self.ListStore.set_sort_column_id(4,gtk.SORT_ASCENDING)
+        self.ListStore.set_sort_column_id(1,gtk.SORT_ASCENDING)
+
+        gtk.gdk.threads_leave()
+
+        # Notify other threads that we're finished updating
+        self.shows_are_updating = False
+
+    # Clicked on start-transfer or double-clicked row
+    def addTransfer(self, tv, pa, col):
+        show = self.ListStore.get_iter(pa)
+        pk = ProgressKeeper()
+        self.Transfers.append(pk)
+
+        self.startTransfer(show, pk)
+
+    def updateProgress(self):
+        total = 0.0
+        denom = 0.0
+        allfinished = True
+
+        # First check if every transfer is complete.  progress of each is set to -1 if done.
+        for each in self.Transfers:
+            if (each.progress > -1):
+                allfinished = False
+
+        # if they're all finished, erase the whole queue and set everything to blank.
+        if (allfinished):
+            self.Transfers = []
+            self.progressBarAll.set_fraction(0)
+            self.progressBarAll.set_sensitive(False)
+            self.labelProgress.set_text("")
+            return
+
+        # But if they're not all done, sum up the fraction for each. Use 1.0 for any in
+        # the queue that are already finished, until all are done.  Otherwise things go freaky.
+        for each in self.Transfers:
+            denom += 1
+            if (each.progress > -1): total += each.progress
+            else: total += 1
+
+        self.progressBarAll.set_sensitive(True)
+        self.progressBarAll.set_fraction(total/denom)
+
+
+    # Fetch a show; each transfer runs in its own thread
+    @threaded
+    def startTransfer(self, row, pk):
+        # Get info about the show
+        show = {}
+        stitle = self.ListStore.get_value(row,S_SIMPLETITLE)
+
+        show['showname']   = stitle.replace("/","-")
+        show['url']     = self.ListStore.get_value(row,S_URL)
+        show['episode'] = self.ListStore.get_value(row,S_EPISODE)
+        show['size']    = int(self.ListStore.get_value(row,S_SIZE))
+
+        show['title']   = stitle.replace("/","-")
+        # If show has an episode name, use that in the title too.
+        if show['episode']:
+            show['title'] += ' - ' + show['episode']
+
+        showdate = self.ListStore.get_value(row,S_DATE)
+        showdate = showdate.replace("\n","")
+        showdate = showdate.replace("<small>"," - ")
+        showdate = showdate.replace("</small>","")
+        show['date'] = showdate
+
+        # Get target video options from prefs panel
+        vidoptions = self.ComboFormat.get_active()
+        if (vidoptions < 0):
+            vidoptions = 1  # Use the default (iPod) if nothing specified
+
+        show['format'] = self.ComboFormat.get_model()[vidoptions][1]
+        show['command'] = self.ComboFormat.get_model()[vidoptions][2]
+
+#        print show
+
+        gtk.gdk.threads_enter()
+        self.labelStatus.set_markup("<i>Queued "+show['title']+".</i>")
+        self.ListStore.set_value(row,S_ACTION, gtk.STOCK_JUMP_TO)
+        gtk.gdk.threads_leave()
+
+        # This is used to scale the progress bar value
+        fractionscaler = 2.0
+        if (vidoptions==RAWITEM):
+            fractionscaler = 1.0
+
+        # Set up filenames for file transfers
+        filefetch = tempfile.NamedTemporaryFile('w+b',-1,".mpg","tivo-")
+        filedecoded = tempfile.NamedTemporaryFile('w+b',-1,".mpg","tivo-")
+        show['outfile'] = '%s/%s - %s' % (
+                           self.destdir,
+                           show['showname'],
+                           show['episode'] and show['episode'] or showdate)
+
+        # Ready! Use urllib2 to pull the file from the Tivo.
+        self.FetchLock.acquire()  # Can only fetch one file at a time!
+
+        # Check for lock release due to QUIT event
+        if self.globalhalt:
+            self.FetchLock.release()
+            return
+
+        # TODO: parse the url correctly, don't assume port 80!
+        authurl = 'http://%s:80' % self.ipaddr
+
+        # Tivo can't handle two requests on top of each other, so we need
+        # to put a small delay here before we begin
+        time.sleep(3)
+
+        gtk.gdk.threads_enter()
+        self.labelStatus.set_markup('<i>Processing %s.</i>' % show['title'])
+        self.ListStore.set_value(row,S_ACTION, gtk.STOCK_MEDIA_RECORD)
+        gtk.gdk.threads_leave()
+
+        cookiejar = cookielib.CookieJar()
+        cookiehandler = urllib2.HTTPCookieProcessor(cookiejar)
+        authhandler = urllib2.HTTPDigestAuthHandler()
+        authhandler.add_password('TiVo DVR', authurl, 'tivo', self.mak)
+        opener = urllib2.build_opener(cookiehandler, authhandler) # i love cookies!
+        urllib2.install_opener(opener)
+
+        try:
+            result = urllib2.urlopen(show['url'])
+
+        except urllib2.HTTPError, e:
+        # except urllib2.error.URLError as e:
+        #     e.read().decode("utf8", 'ignore')
+            print e.code, e.msg, e.headers.get('tivo-message','')
+
+            gtk.gdk.threads_enter()
+            self.labelProgress.set_text('')
+            self.labelStatus.set_text('%s %s - %s (%s)' % (
+                e.code, e.msg,
+                e.headers.get('tivo-message','Tivo sent no further error info'),
+                title))
+            self.ListStore.set_value(row,S_ACTION, gtk.STOCK_DIALOG_WARNING)
+            gtk.gdk.threads_leave()
+
+            pk.progress = -1  # Magic number indicates we're all finished
+            self.updateProgress()
+
+            self.FetchLock.release()
+            return
+
+        # Now we're going to copy the file, in chunks!  I love chunks.
+        headers = result.info()
+
+        i =0
+        a = True
+        MAGIC_NUMBER = 1024*128  # Transfer in 128k chunks
+
+        while a:
+            a = result.read(MAGIC_NUMBER)
+            filefetch.write(a)
+
+            i += MAGIC_NUMBER
+            frac = float(i) / show['size'] / fractionscaler
+
+            gtk.gdk.threads_enter()
+            self.labelProgress.set_text("Receiving %d KB..." % (i/1024))
+            gtk.gdk.threads_leave()
+
+            pk.progress = frac
+            self.updateProgress()
+
+            # Check for user cancel (hacky thready crufty thing)
+            if self.globalhalt:
+                self.FetchLock.release()
+                return
+
+        # All done copying; fail if the file really small.
+        if i < MAGIC_NUMBER * 4:
+            print result.code, result.msg, headers.items()
+
+            gtk.gdk.threads_enter()
+            self.labelStatus.set_text('Failed: Tivo says this file is empty or too small')
+            self.ListStore.set_value(row,S_ACTION, gtk.STOCK_DIALOG_WARNING)
+            gtk.gdk.threads_leave()
+
+            pk.progress = -1  # Magic number indicates we're all finished
+            self.updateProgress()
+
+            self.FetchLock.release()
+            return
+
+        # Done copying.  Release file-transfer lock so next thread can start
+        filefetch.flush()
+        self.FetchLock.release()
+
+        # ..And then grab converter lock so we can start the CPU-intensive work
+        self.ConverterLock.acquire()
+
+        # Check if lock released due to QUIT event!
+        if self.globalhalt:
+            self.ConverterLock.release()
+            return
+
+        gtk.gdk.threads_enter()
+        self.labelProgress.set_text("Decoding...")
+        gtk.gdk.threads_leave()
+
+        decodetowhere = '%s.%s' % (show['outfile'], show['format'])
+
+        if (vidoptions != RAWITEM):
+            decodetowhere = filedecoded.name
+            pk.progress = 0.50
+            self.updateProgress()
+
+        # Decode Tivo stream
+        cmd = 'nice -n 10 tivodecode -m %s -o "%s" %s' % (
+               self.mak, decodetowhere, filefetch.name)
+
+        p = subprocess.Popen(cmd, shell=True, stdin=PIPE, stdout=PIPE, stderr=STDOUT, close_fds=True)
+        (cmdin, cmdout) = (p.stdin, p.stdout)
+
+        k = "line"
+        while (k != ""):
+            k = cmdout.readline()
+
+            # Check for user cancel (hacky thready crufty thing)
+            if self.globalhalt:
+                self.ConverterLock.release()
+                return
+
+        # Anything other than a raw copy needs a call to mencoder/ffmpeg:
+        if (vidoptions != RAWITEM):
+            show['infile'] = filedecoded.name
+            show['tags'] = VIDEOTAGS % show   # Recursive!  Holy crap!
+
+            # Before we begin transcoding, I have to calculate the new
+            # dimensions of the file.  Mencoder used to do this for me *sigh*
+            cmd = 'ffmpeg -i "%s"' % show['infile']
+
+            p = subprocess.Popen(cmd, shell=True, stdin=PIPE, stdout=PIPE, stderr=STDOUT, close_fds=True, universal_newlines=True)
+            (cmdin, cmdout) = (p.stdin, p.stdout)
+
+            lines = cmdout.read()
+            match = re.search('Stream.*?(\d{3,4})x(\d{3,4})', lines)  # Matches a line that contains Stream and followed by 123x456
+#            print match.groups()
+#            print "Looks like this stream is %sx%s!" % (match.group(1), match.group(2))
+
+            # Build the command line - show{} has all the details we need.
+            cmd = 'nice -n 5 ' + show['command']
+            cmd = cmd % show
+#            print "HERE WE GO!",cmd
+
+            # Note, universal_newlines lets us parse readline() on arrival of \r
+            p = subprocess.Popen(cmd, shell=True, stdin=PIPE, stdout=PIPE, stderr=STDOUT, close_fds=True, universal_newlines=True)
+            (cmdin, cmdout) = (p.stdin, p.stdout)
+
+            # First, grep for the Duration: tag so we know how long the clip is
+            lengthsearch = re.compile('(?<=Duration: )\d+:\d+:\d+')
+            total_duration = ''
+
+            lengthline = cmdout.readline()
+            while (lengthline):
+#                print lengthline
+                length = lengthsearch.findall(lengthline)
+                if length:
+                    total_duration = length
+#                    print "Got a duration!", total_duration
+                    break
+                lengthline = cmdout.readline()
+
+            # Then, convert duration to seconds
+            hours, minutes, seconds = total_duration[0].split(':')
+            full_length_in_seconds = int(hours)*3600 + int(minutes)*60 + int(seconds)
+
+            # And finally, loop over the progress and update UI as needed
+            timesearch = re.compile('(?<=time\=)\d+')
+
+            progress_line = cmdout.readline()
+            while (progress_line):
+#                print progress_line
+                current_time = timesearch.findall(progress_line)
+                if current_time:
+                    pr = 100.0 * int(current_time[0]) / full_length_in_seconds
+#                    print pr,"%"
+                    msg = "Transcoding %d%%" % pr
+
+                    gtk.gdk.threads_enter()
+                    self.labelProgress.set_text(msg)
+                    gtk.gdk.threads_leave()
+
+                    pk.progress = pr/200 + 0.5
+                    self.updateProgress()
+                progress_line = cmdout.readline()
+
+                # Check for user cancel (hacky thready crufty thing)
+                if self.globalhalt:
+                    self.ConverterLock.release()
+                    return
+
+            # Transcode finished.  Close original (decoded) file
+            filedecoded.close()
+
+        # All done!
+        pk.progress = -1  # Magic number indicates we're all finished
+        self.updateProgress()
+
+        gtk.gdk.threads_enter()
+        self.labelStatus.set_markup("<i>Completed "+show['title']+".</i>")
+        self.ListStore.set_value(row,S_ACTION, gtk.STOCK_APPLY)
+        gtk.gdk.threads_leave()
+
+        self.ConverterLock.release()
+
+    # Use Avahi to populate list of Tivos on the network.
+    def findTivos(self):
+        # Clear list of Tivos
+        self.ComboWhichTivo.set_model(None)
+        self.ComboWhichTivo.clear()
+        liststore = gtk.ListStore(str,str)
+
+        cell = gtk.CellRendererText()
+        self.ComboWhichTivo.pack_start(cell, True)
+        self.ComboWhichTivo.add_attribute(cell,'text',0)
+
+        # Run avahi-browse
+        cmd = 'avahi-browse -l -r -t _tivo-videos._tcp'
+        p = subprocess.Popen(cmd, shell=True, stdin=PIPE, stdout=PIPE, stderr=STDOUT, close_fds=True)
+        (cmdin, cmdout) = (p.stdin, p.stdout)
+
+        k = "line"
+        foundativo = ""
+        ipaddr=""
+
+        # If there's already a Tivo selected in gconf, use that one.
+        lastTivo = self.gconfclient.get_string ("/apps/tivo4tiny/which_tivo")
+
+        while (k != ""):
+            k = cmdout.readline()
+            # First check for '=' which means a new Tivo
+            if (k.find("=") == 0):
+                foundativo = k.split(' ')[3]
+
+            # Then check for 'address' line which has the IP address
+            if (k.find("address")>-1):
+                ipaddr = k[1+k.find('['):k.find(']')]
+
+                # Add this Tivo to combobox.
+                # If this is the one from the last time we ran, be sure it's the first choice
+                if (foundativo == lastTivo):
+                    liststore.prepend([foundativo,ipaddr])
+                    lastTivo = None
+                else:
+                    liststore.append([foundativo,ipaddr])
+
+        # Finally, add the last tivo if it hasn't been found already
+        if (lastTivo != None):
+            liststore.prepend([lastTivo,lastTivo])
+
+        liststore.append(["Manual...","0.0.0.0"])
+        self.ComboWhichTivo.set_model(liststore)
+
+        # if there are any Tivos found, set first item to active selection,
+        if (len(liststore) >1):   # >1 because "Manual..." entry is always there
+            self.ComboWhichTivo.set_active(0)
+
+    # close the window and quit
+    def delete_event(self, widget=None, event=None, data=None): # (self, widget, event, data=None):
+
+        # First, we need to release the GTK UI thread so the children can exit
+        gtk.gdk.threads_leave()
+
+        # Then set the signal that children threads need to quit.
+        self.globalhalt = True
+
+        # And eventually, they'll all get the message!
+        while threading.activeCount() > 1:
+            time.sleep(0.5)
+
+        # And now that all child threads are gone, let's quit.
+        gtk.gdk.threads_enter()
+        gtk.main_quit()
+        return False
+
+    # Prefs dialog should remain in existence even after closing/hiding
+    def prefs_delete_event(self, widget, event, data=None):
+            return True
+
+    def showAddWindow(self):
+            self.addWindow.show_all()
+
+    def showPrefsWindow(self, widget):
+            self.PrefsWindow.show_all()
+
+    def __init__(self):
+        # Some threading variables
+        self.FetchLock = threading.Lock()
+        self.ConverterLock = threading.Lock()
+        self.globalhalt = False
+        self.Transfers = []
+
+        # Set Glade file and init base window
+        self.gladefile = "/usr/share/tivo4tiny/tivo4tiny.glade"
+        self.wTree = gtk.glade.XML(self.gladefile)
+
+        self.labelProgress = self.wTree.get_widget("labelProgress")
+        self.labelStatus = self.wTree.get_widget("labelStatus")
+        self.buttonUpdate = self.wTree.get_widget("ButtonUpdateList")
+        self.ComboWhichTivo = self.wTree.get_widget("ComboWhichTivo")
+        self.progressBarAll = self.wTree.get_widget("ProgressBarAll")
+        self.progressBarAll.set_sensitive(False)
+
+        #Get the main windows, and connect the "destroy" events
+        self.addWindow = self.wTree.get_widget("dialogAddTivo")
+        self.addEntry = self.wTree.get_widget("entryAddTivo")
+        self.addWindow.connect("delete_event", self.prefs_delete_event)
+        self.addWindow.set_deletable(False)
+
+        self.PrefsWindow = self.wTree.get_widget("PrefsDialog")
+        self.PrefsWindow.connect("delete_event", self.prefs_delete_event)
+        self.PrefsWindow.set_deletable(False)
+
+        self.window = self.wTree.get_widget("MainWindow")
+        if (self.window):
+            self.window.connect("destroy", self.delete_event)
+
+        self.EntryMak = self.wTree.get_widget("EntryMak")
+        self.EntryFolder = self.wTree.get_widget("EntryFolder")
+        self.ComboFormat = self.wTree.get_widget("ComboFormat")
+
+        # Populate the video conversion options
+        self.ComboFormat.set_model(None)
+        self.ComboFormat.clear()
+        liststore = gtk.ListStore(str,str,str)
+        cell = gtk.CellRendererText()
+        self.ComboFormat.pack_start(cell, True)
+        self.ComboFormat.add_attribute(cell,'text',0)
+        for each in CONVERSIONS:
+            liststore.append([each[0], each[1], each[2]])
+        self.ComboFormat.set_model(liststore)
+
+        # Initialize GConf and pull prefs from gconf database
+        self.gconfclient = gconf.client_get_default ();
+        self.gconfclient.add_dir ("/apps/tivo4tiny",gconf.CLIENT_PRELOAD_NONE)
+
+        self.mak = self.gconfclient.get_string ("/apps/tivo4tiny/media_access_key")
+        self.destdir = self.gconfclient.get_string ("/apps/tivo4tiny/dest_dir")
+        self.videoformat = self.gconfclient.get_int("/apps/tivo4tiny/video_format")
+
+        if (self.mak != None):  self.EntryMak.set_text(self.mak)
+        if (self.destdir == None):
+            print "No destination set. Setting to HOME."
+            self.destdir = os.path.expanduser("~")
+            self.EntryFolder.set_text(self.destdir)
+        else:
+            self.EntryFolder.set_text(self.destdir)
+
+        if (self.videoformat == None):
+            self.ComboFormat.set_active(0)
+        else:
+            self.ComboFormat.set_active(self.videoformat)
+
+
+        # create a ListStore with several columns to use as the model
+        # Icon, Show, Date, Length, Action, Link
+        # (this link will need to change later)
+
+        self.ListStore = gtk.ListStore(str, str, str, str, str, str, str, str, str)
+
+        # create the TreeView using treestore
+        self.ListView = self.wTree.get_widget("ListView")
+        self.ListView.set_model(None)
+
+        # set the cell renderers for each column
+        cell = gtk.CellRendererText()
+
+        celltruncatable = gtk.CellRendererText()
+        celltruncatable.set_property('ellipsize',pango.ELLIPSIZE_END)
+
+        pixcell = gtk.CellRendererPixbuf()
+
+        # And create the columns using the right cell renderers.
+        ColumnIcon = gtk.TreeViewColumn('Channel')
+        ColumnIcon.pack_start(cell,True)
+        ColumnIcon.set_attributes(cell, text=0)
+        ColumnIcon.set_sort_column_id(0)
+
+        ColumnShow = gtk.TreeViewColumn('Show')
+        ColumnShow.pack_start(celltruncatable,True)
+        ColumnShow.set_attributes(celltruncatable, markup=1)
+        ColumnShow.set_sort_column_id(1)
+        ColumnShow.set_expand(True)
+
+        ColumnDate = gtk.TreeViewColumn('Date')
+        ColumnDate.pack_start(cell,True)
+        ColumnDate.set_attributes(cell, markup=2)
+        ColumnDate.set_sort_column_id(2)
+
+        ColumnLength = gtk.TreeViewColumn('Length')
+        ColumnLength.pack_start(cell,True)
+        ColumnLength.set_attributes(cell, text=3)
+        ColumnLength.set_sort_column_id(3)
+
+        ColumnAction = gtk.TreeViewColumn('Action')
+        ColumnAction.pack_start(pixcell,True)
+        ColumnAction.set_attributes(pixcell, stock_id=4)
+        ColumnAction.set_sort_column_id(4)
+
+        self.ListView.append_column(ColumnIcon)
+        self.ListView.append_column(ColumnShow)
+        self.ListView.append_column(ColumnDate)
+        self.ListView.append_column(ColumnLength)
+        self.ListView.append_column(ColumnAction)
+
+        # Connect glade events
+        dic = { "on_ListView_row_activated" : self.addTransfer,
+            "on_MainWindow_destroy" : self.delete_event,
+            "on_PrefsDialog_destroy" : self.closePrefsWindow,
+            "on_dialogAddTivo_destroy" : self.closeAddWindow,
+            "on_dialogAddTivo_close" : self.closeAddWindow,
+            "on_ButtonShowPrefs_clicked" : self.showPrefsWindow,
+            "on_EntryMak_changed" : self.entryMakChanged,
+            "on_ComboFormat_changed" : self.comboFormatChanged,
+            "on_ComboWhichTivo_changed" : self.buttonWhichTivoClicked,
+            "on_EntryFolder_changed" : self.entryFolderChanged,
+            "on_ButtonPrefsOK_clicked" : self.prefsOKClicked,
+            "on_btnAddTivoOK_clicked" : self.addManualTivo,
+            "on_btnAddTivoCancel_clicked" : self.closeAddWindow,
+            "on_ButtonChooseFolder_clicked" : self.chooseFolderClicked,
+            "on_ButtonUpdateList_clicked" : self.buttonWhichTivoClicked
+        }
+        self.wTree.signal_autoconnect(dic)
+
+        #self.ListVietreeview.get_selection().connect("changed", self.on_selection_changed, ...)
+
+        self.window.show_all()
+        if (self.mak==None): self.PrefsWindow.show_all()
+
+
+    def entryMakChanged(self, widget):
+        self.mak = self.EntryMak.get_text()
+        self.gconfclient.set_string ("/apps/tivo4tiny/media_access_key",self.mak)
+
+    def comboFormatChanged(self, widget):
+        vidoptions = self.ComboFormat.get_active()
+        if (vidoptions < 0):
+            vidoptions = 0  # Use the default (iPod) if no format suggested
+        self.gconfclient.set_int("/apps/tivo4tiny/video_format", vidoptions)
+
+    def entryFolderChanged(self, widget):
+        self.destdir = self.EntryFolder.get_text()
+        self.gconfclient.set_string ("/apps/tivo4tiny/dest_dir",self.destdir)
+
+    def closePrefsWindow(self, widget):
+        self.PrefsWindow.hide_all()
+
+    def closeAddWindow(self, widget):
+        self.addWindow.hide_all()
+
+    # User typed in a manual IP address and clicked "OK"
+    def addManualTivo(self,widget):
+        entry = self.addEntry.get_text()
+
+        if (len(entry)>0):
+            tivo = entry
+            ipaddr = entry
+
+            # then create an entry for that item
+            self.ComboWhichTivo.get_model().prepend([tivo,ipaddr])
+            self.ComboWhichTivo.set_active(0)
+            # Save the choice
+            self.gconfclient.set_string ("/apps/tivo4tiny/which_tivo", tivo)
+            # And, now let's repopulate the show list.
+            self.updateShowList()
+
+        self.addWindow.hide_all()
+
+
+    def buttonWhichTivoClicked(self, widget):
+        # Which Tivo is selected?
+        item = self.ComboWhichTivo.get_active()
+        if (item < 0): return
+
+        self.tivo = self.ComboWhichTivo.get_model()[item][0]
+        self.ipaddr = self.ComboWhichTivo.get_model()[item][1]
+
+        if (self.tivo == "Manual..."):
+            # Ask what IP address to connect to
+            self.showAddWindow()
+
+        else:
+            # Save the choice
+            self.gconfclient.set_string ("/apps/tivo4tiny/which_tivo", self.tivo)
+            # And, now that it's all done, let's repopulate the show list.
+            self.updateShowList()
+
+    @threaded
+    def updateShowList(self):
+        # Spawn a thread to populate the show list, and then update UI bar
+        # until it's done
+        self.shows_are_updating = True
+        self.populateShows()
+
+        while self.shows_are_updating:
+            gtk.gdk.threads_enter()
+            self.progressBarAll.pulse()
+#            self.progressBarAll.set_sensitive(False)
+#            self.labelProgress.set_text("")
+            gtk.gdk.threads_leave()
+
+            if self.globalhalt: return
+
+            time.sleep(0.25)
+
+        gtk.gdk.threads_enter()
+        self.progressBarAll.set_fraction(0)
+        self.progressBarAll.set_sensitive(False)
+        self.labelProgress.set_text("")
+        gtk.gdk.threads_leave()
+
+
+    def prefsOKClicked(self, widget):
+        self.PrefsWindow.hide_all()
+        self.buttonUpdate.set_sensitive(True)
+
+    def addOKClicked(self, widget):
+        self.addWindow.hide_all()
+
+    def chooseFolderClicked(self, widget):
+        print "Not yet implemented"
+
+# -------------------------------------------------------
+# Weird little support functions, from the web
+
+# Hex number converter
+from string import upper
+def str2int(s, base):
+    accum = 0
+
+    # ASCII/UNICODE values of these characters
+    zero = ord('0')
+    nine = ord('9')
+    alpha = ord('A')
+    omega = ord('Z')
+
+    for n in range(len(s)):
+        numeral = ord(upper(s[-(n+1)]))
+
+        if numeral in range(zero, nine+1):
+            accum += (numeral - zero) * (base ** n)
+        elif (numeral in range(alpha, omega)) and (base > 10):
+            accum += ((numeral - alpha) + 10) * (base ** n)
+        else:
+            # invalid number
+            accum = 0
+            break
+    return accum
+
+
+# -----------------------------------------------------
+# Run it!
+sucker = TivoSucker()
+sucker.findTivos()
+
+gtk.gdk.threads_init()
+gtk.main()
