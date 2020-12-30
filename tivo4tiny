@@ -5,6 +5,9 @@
 # (c) 2009 Billy Charlton, San Francisco CA, USA
 # Licensed under the GNU GPL Version 3.0  http://www.gnu.org
 
+# Code forked from https://sourceforge.net/projects/tivo4tiny/
+# Needs to be updated for Python3 yet, but I needed this project for myself.
+
 # Dependencies:
 # tivodecode, ffmpeg, python-gtk2, python-glade2, python-gconf, avahi-utils
 
@@ -33,6 +36,7 @@ import datetime, time
 import tempfile
 import urllib2, cookielib, socket
 import logging
+import ssl
 
 from xml.dom import DOMException
 from xml.parsers.expat import ExpatError
@@ -40,8 +44,8 @@ from xml.parsers.expat import ExpatError
 # setup logging
 logging.basicConfig(format='%(levelname)s:%(message)s', level=logging.DEBUG)
 
-import ssl
-
+# Disable SSL check
+# TODO: add SSL options and validation
 try:
     _create_unverified_https_context = ssl._create_unverified_context
 except AttributeError:
