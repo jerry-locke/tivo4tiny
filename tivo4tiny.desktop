@@ -1,0 +1,14 @@
+[Desktop Entry]
+Version=0.11
+Encoding=UTF-8
+Name=Tivo Mobile
+Type=Application
+Terminal=false
+Icon=/usr/share/tivo4tiny/tivo4tiny.png
+Name=Tivo 4 Tiny
+Exec=tivo4tiny
+Comment=Fetch and convert shows from your Tivo
+Comment=Tivo Program Fetcher
+GenericName=Tivo 4 Tiny
+Categories=Application;AudioVideo;Player;
+
